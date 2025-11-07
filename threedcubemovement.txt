@@ -1,0 +1,444 @@
+/**
+ * Maze Tracer 3D — APDE-safe Cube Edge Tracer (Origin at Cube Corner)
+ * - Renderer: P3D
+ * - 2m × 2m × 2m cube with (0,0,0) at a corner
+ * - Big red spheres at vertices; tracer auto-runs along edges
+ * - Pauses 0.5s at each vertex and shows its (x,y,z) tuple as popup text
+ * - NEW: Each vertex shows its index and (x,y,z) tuple beside the red point
+ * - Axes originate at corner (0,0,0) and align with cube edges (+X,+Y,+Z)
+ * - Orbit camera (drag), zoom via keys or on-screen buttons
+ * - Ground grid + HUD with (x,y,z) in meters + per-vertex labels
+ *
+ * Controls:
+ *   Drag: orbit camera
+ *   [: zoom in   ]: zoom out
+ *   R: reset tracer
+ *   Space: pause/resume
+ *   G: toggle ground grid
+ *   A: toggle axes
+ *   Tap +/− buttons (top-right) to zoom on touch devices
+ */
+
+final float PX_PER_M = 100.0f;     // pixels per meter
+final float EDGE_M    = 2.0f;      // cube edge length in meters
+final float EDGE_PX   = EDGE_M * PX_PER_M; // pixels
+final int   TRACE_DURATION_MS = 12000;     // moving time over all edges
+final int   DWELL_MS = 500;                // pause 0.5s at each vertex
+
+// Geometry
+PVector[] verts;     // 8 cube vertices (world px)
+int[] pathOrder;     // edge-walk order over vertices
+ArrayList<PVector> trail2D = new ArrayList<PVector>(); // HUD trail points (screen px)
+
+// For HUD vertex labels (screen projections each frame)
+float[] vScreenX = new float[8];
+float[] vScreenY = new float[8];
+
+// Time / tracer
+int lastMillis;
+float tSeg = 0;      // 0..1 within segment
+int segIdx = 0;
+boolean paused = false;
+
+// Dwell state
+boolean atVertex = false;      // parked on a vertex?
+int dwellRemaining = 0;        // ms left to dwell
+int lastArrivedVertex = -1;    // vertex index we just reached (for popup)
+
+// Camera/orbit (camera orbits around cube center, NOT at origin corner)
+float camYaw   = PI/5.0f;     // left-right orbit angle
+float camPitch = -PI/7.0f;    // up-down orbit angle
+float camDist  = 6.0f * PX_PER_M; // distance in pixels
+int pmx, pmy;
+boolean dragging = false;
+
+// Look target = cube center
+final PVector lookTarget = new PVector(EDGE_PX/2f, EDGE_PX/2f, EDGE_PX/2f);
+
+// Toggles
+boolean showGrid = true;
+boolean showAxes = true;
+
+// UI buttons (zoom/pause)
+class Btn {
+  String label; float x,y,w,h; int id; // 0 = zoom in, 1 = zoom out, 2 = pause
+  Btn(String label,float x,float y,float w,float h,int id){this.label=label;this.x=x;this.y=y;this.w=w;this.h=h;this.id=id;}
+  void draw(){
+    hint(DISABLE_DEPTH_TEST);
+    pushStyle(); noStroke();
+    fill(255,245); rect(x,y,w,h,10);
+    fill(0); textAlign(CENTER,CENTER); textSize(22); text(label, x+w/2, y+h/2);
+    popStyle();
+    hint(ENABLE_DEPTH_TEST);
+  }
+  boolean over(float mx,float my){ return mx>=x && mx<=x+w && my>=y && my<=y+h; }
+  void click(){
+    if (id==0) zoomBy(-0.1f);
+    if (id==1) zoomBy(+0.1f);
+    if (id==2) paused = !paused;
+  }
+}
+Btn btnPlus, btnMinus, btnPause;
+
+void settings() {
+  fullScreen(P3D);   // APDE-friendly
+  // size(1280,720,P3D); // desktop alternative
+}
+
+void setup() {
+  smooth(8);
+  initCubeCornerOrigin();
+  lastMillis = millis();
+  float bw=64, bh=44, pad=14;
+  btnPlus  = new Btn("+", width - pad - bw, pad, bw, bh, 0);
+  btnMinus = new Btn("−", width - pad - bw, pad + bh + 8, bw, bh, 1);
+  btnPause = new Btn("⏯", width - pad - bw, pad + 2*(bh + 8), bw, bh, 2);
+}
+
+void draw() {
+  // --- time step ---
+  int now = millis();
+  int dt = now - lastMillis;
+  lastMillis = now;
+  if (!paused) advanceTracer(dt);
+
+  // --- 3D viewport ---
+  background(255);
+  setCamera();
+
+  // Ground grid at z = 0 (from origin corner outward)
+  if (showGrid) drawGroundGridCorner(EDGE_M*2.0f, 0.25f); // size in meters, step meters
+
+  // Axes from the corner origin
+  if (showAxes) drawAxesFromCorner(EDGE_PX * 1.2f);
+
+  // Cube
+  stroke(20); strokeWeight(2); noFill();
+  drawCubeEdges();
+  drawVertices();
+
+  // Tracer sphere + compute screen projection for trail
+  PVector tracer = getTracerWorldPx();
+  pushMatrix();
+  translate(tracer.x, tracer.y, tracer.z);
+  noStroke(); fill(255,0,0);
+  sphereDetail(24);
+  sphere(PX_PER_M * 0.08f); // ~8 cm radius
+  popMatrix();
+
+  // --- collect projected 2D point for trail & vertex label projections ---
+  float sx = screenX(tracer.x, tracer.y, tracer.z);
+  float sy = screenY(tracer.x, tracer.y, tracer.z);
+  trail2D.add(new PVector(sx, sy));
+  if (trail2D.size() > 400) trail2D.remove(0);
+
+  for (int i=0;i<verts.length;i++){
+    vScreenX[i] = screenX(verts[i].x, verts[i].y, verts[i].z);
+    vScreenY[i] = screenY(verts[i].x, verts[i].y, verts[i].z);
+  }
+
+  // --- HUD (2D overlay) ---
+  drawHUD(tracer, sx, sy);
+
+  // UI buttons
+  btnPlus.draw();
+  btnMinus.draw();
+  btnPause.draw();
+}
+
+// ============================= Geometry ==============================
+
+/**
+ * Build cube with (0,0,0) at a corner, edges along +X,+Y,+Z.
+ * Vertex indices (xyz bits):
+ * 0:(0,0,0) 1:(E,0,0) 2:(0,E,0) 3:(E,E,0) 4:(0,0,E) 5:(E,0,E) 6:(0,E,E) 7:(E,E,E)
+ */
+void initCubeCornerOrigin() {
+  verts = new PVector[8];
+  float[] s = { 0, EDGE_PX };
+  int idx = 0;
+  for (int zi = 0; zi < 2; zi++) {
+    for (int yi = 0; yi < 2; yi++) {
+      for (int xi = 0; xi < 2; xi++) {
+        verts[idx++] = new PVector(s[xi], s[yi], s[zi]);
+      }
+    }
+  }
+  // Walk all edges in a nice loop touching each face ring + some diagonals along edges
+  pathOrder = new int[]{ 0,1,3,2,0, 4,5,7,6,4, 5,1,3,7,6,2,0 };
+  segIdx = 0; tSeg = 0; trail2D.clear();
+  atVertex = true;                    // start paused at the first vertex
+  dwellRemaining = DWELL_MS;
+  lastArrivedVertex = pathOrder[0];
+}
+
+void drawCubeEdges() {
+  int[][] edges = {
+    {0,1},{2,3},{4,5},{6,7}, // x-edges
+    {0,2},{1,3},{4,6},{5,7}, // y-edges
+    {0,4},{1,5},{2,6},{3,7}  // z-edges
+  };
+  for (int[] e : edges) {
+    PVector a = verts[e[0]], b = verts[e[1]];
+    line(a.x, a.y, a.z, b.x, b.y, b.z);
+  }
+}
+
+void drawVertices() {
+  noStroke(); fill(255,0,0);
+  for (PVector v : verts) {
+    pushMatrix();
+    translate(v.x, v.y, v.z);
+    sphere(PX_PER_M * 0.06f); // ~6 cm
+    popMatrix();
+  }
+}
+
+// ============================ Tracer ===============================
+
+void advanceTracer(int dt) {
+  if (pathOrder.length < 2) return;
+
+  float totalSegs = pathOrder.length - 1;
+  float segMs = TRACE_DURATION_MS / totalSegs; // moving time per edge
+
+  if (atVertex) {
+    dwellRemaining -= dt;
+    if (dwellRemaining <= 0) {
+      atVertex = false;
+      dwellRemaining = 0;
+      // begin next edge
+      segIdx = (segIdx + 1) % (pathOrder.length - 1);
+      tSeg = 0;
+    }
+    return;
+  }
+
+  // Moving along an edge
+  tSeg += dt / segMs;
+  if (tSeg >= 1.0f) {
+    // Snap to vertex and dwell
+    tSeg = 1.0f;
+    atVertex = true;
+    dwellRemaining = DWELL_MS;
+    int i1 = pathOrder[segIdx + 1];
+    lastArrivedVertex = i1;
+  }
+}
+
+PVector getTracerWorldPx() {
+  int i0 = pathOrder[segIdx];
+  int i1 = pathOrder[segIdx + 1];
+  if (atVertex) {
+    return verts[lastArrivedVertex >= 0 ? lastArrivedVertex : i0];
+  } else {
+    return PVector.lerp(verts[i0], verts[i1], tSeg);
+  }
+}
+
+// ============================ Camera / Orbit ==============================
+
+void setCamera() {
+  // Spherical orbit around lookTarget → Cartesian camera
+  float cx = lookTarget.x + camDist * cos(camPitch) * cos(camYaw);
+  float cy = lookTarget.y + camDist * sin(camPitch);
+  float cz = lookTarget.z + camDist * cos(camPitch) * sin(camYaw);
+  // Look at cube center; up = +Y (use 0,-1,0 because screen Y grows down)
+  camera(cx, cy, cz, lookTarget.x, lookTarget.y, lookTarget.z, 0, -1, 0);
+  perspective(PI/3.0f, (float)width/height, PX_PER_M*0.02f, PX_PER_M*1000.0f);
+}
+
+void zoomBy(float amount) {
+  // negative = zoom in, positive = out
+  camDist *= (1.0f + 0.8f * amount);
+  camDist = constrain(camDist, PX_PER_M * 1.2f, PX_PER_M * 40.0f);
+}
+
+// ============================= HUD & Helpers ==============================
+
+void drawHUD(PVector tracerWorldPx, float tracerSX, float tracerSY) {
+  // Prepare 2D overlay
+  hint(DISABLE_DEPTH_TEST);
+  pushMatrix(); pushStyle();
+  camera(); // reset to default 2D
+  ortho(0, width, 0, height, -1, 1);
+
+  // Trail
+  noFill();
+  stroke(0,150,255);
+  strokeWeight(2);
+  beginShape();
+  for (PVector p : trail2D) vertex(p.x, p.y);
+  endShape();
+
+  // Text HUD
+  fill(0);
+  textAlign(LEFT, BOTTOM);
+  textSize(22);
+  String status = paused ? "PAUSED" : (atVertex ? "DWELL (0.5s)" : "RUNNING");
+  float xm = tracerWorldPx.x / PX_PER_M;
+  float ym = tracerWorldPx.y / PX_PER_M;
+  float zm = tracerWorldPx.z / PX_PER_M;
+  text("Mode: " + status + "   Cube Edge: 2 m   Scale: " + nf(PX_PER_M,0,0) + " px/m", 20, height - 22);
+  text("Tracer (x,y,z) m: (" + nf(xm,1,2) + ", " + nf(ym,1,2) + ", " + nf(zm,1,2) + ")", 20, height - 50);
+
+  // Title
+  textAlign(LEFT, TOP);
+  text("3D Cube (Origin at Corner) • Auto Trace • Vertex Tuples + 0.5s Stop", 20, 20);
+  text("Controls: Drag=orbit, [ ]=zoom,  [R]=reset, [Space]=pause, [G]=grid, [A]=axes", 20, 48);
+
+  // --- Vertex index + tuple labels beside each red point (in meters) ---
+  textSize(18);
+  textAlign(LEFT, CENTER);
+  for (int i=0;i<verts.length;i++){
+    float vxm = verts[i].x / PX_PER_M;
+    float vym = verts[i].y / PX_PER_M;
+    float vzm = verts[i].z / PX_PER_M;
+    String tup = "(" + nf(vxm,0,0) + ", " + nf(vym,0,0) + ", " + nf(vzm,0,0) + ") m";
+    String label = i + ": " + tup;
+    float tx = vScreenX[i] + 8; // offset so it doesn't overlap the sphere
+    float ty = vScreenY[i];
+
+    if (!Float.isNaN(tx) && !Float.isNaN(ty) && tx>=-80 && tx<=width+80 && ty>=-40 && ty<=height+40){
+      // white rounded pill for clarity
+      float padX = 8, padY = 6;
+      float tw = textWidth(label);
+      noStroke(); fill(255, 235);
+      rect(tx - padX, ty - (textAscent()*0.6f), tw + 2*padX, textAscent()*0.9f + padY, 8);
+
+      // dark red text to match points
+      fill(190, 0, 0);
+      text(label, tx, ty);
+    }
+  }
+
+  // --- Arrival popup while dwelling at a vertex (near tracer) ---
+  if (atVertex && lastArrivedVertex >= 0 && !Float.isNaN(tracerSX) && !Float.isNaN(tracerSY)) {
+    float vxm = verts[lastArrivedVertex].x / PX_PER_M;
+    float vym = verts[lastArrivedVertex].y / PX_PER_M;
+    float vzm = verts[lastArrivedVertex].z / PX_PER_M;
+    String tup = "(" + nf(vxm,0,0) + ", " + nf(vym,0,0) + ", " + nf(vzm,0,0) + ") m";
+
+    float pad = 10;
+    textSize(22);
+    textAlign(LEFT, CENTER);
+    String msg = "⦿ " + lastArrivedVertex + ": " + tup;
+    float tw = textWidth(msg);
+    float tx = tracerSX + 14;
+    float ty = tracerSY - 14;
+
+    if (tx + tw + 2*pad > width) tx = width - tw - 2*pad - 10;
+    if (ty - 18 < 0) ty = 24;
+
+    noStroke();
+    fill(255, 240);
+    rect(tx - pad, ty - 18, tw + 2*pad, 34, 8);
+    fill(0);
+    text(msg, tx, ty);
+  }
+
+  popStyle(); popMatrix();
+  hint(ENABLE_DEPTH_TEST);
+}
+
+// Axes from the corner origin (0,0,0) along +X,+Y,+Z
+void drawAxesFromCorner(float len) {
+  strokeWeight(3);
+  // X (red)
+  stroke(220,0,0); line(0,0,0,  len,0,0);
+  // Y (green)
+  stroke(0,180,0); line(0,0,0,  0,len,0);
+  // Z (blue)
+  stroke(0,0,220); line(0,0,0,  0,0,len);
+
+  // Tips (small spheres)
+  drawAxisTip(len,0,0);
+  drawAxisTip(0,len,0);
+  drawAxisTip(0,0,len);
+
+  // Axis letters near tips
+  hint(DISABLE_DEPTH_TEST);
+  pushStyle();
+  fill(0); textSize(20); textAlign(CENTER, CENTER);
+  float sx, sy;
+
+  sx = screenX(len,0,0); sy = screenY(len,0,0);
+  if (!Float.isNaN(sx)) text("X", sx+12, sy);
+
+  sx = screenX(0,len,0); sy = screenY(0,len,0);
+  if (!Float.isNaN(sx)) text("Y", sx+12, sy);
+
+  sx = screenX(0,0,len); sy = screenY(0,0,len);
+  if (!Float.isNaN(sx)) text("Z", sx+12, sy);
+
+  popStyle();
+  hint(ENABLE_DEPTH_TEST);
+}
+
+void drawAxisTip(float x,float y,float z){
+  pushMatrix();
+  translate(x,y,z); noStroke(); fill(0);
+  sphere(PX_PER_M * 0.03f);
+  popMatrix();
+}
+
+// XY ground grid at z=0, starting at corner (0,0,0) and extending outward
+// sizeM = total width/height in meters; stepM = spacing in meters
+void drawGroundGridCorner(float sizeM, float stepM) {
+  int lines = floor(sizeM / stepM);
+  float sizePx = sizeM * PX_PER_M;
+  float stepPx = stepM * PX_PER_M;
+
+  stroke(230); strokeWeight(1);
+  // Vertical lines (parallel to Y) along X
+  for (int i=0; i<=lines; i++){
+    float x = i * stepPx;
+    line(x, 0, 0, x, sizePx, 0);
+  }
+  // Horizontal lines (parallel to X) along Y
+  for (int j=0; j<=lines; j++){
+    float y = j * stepPx;
+    line(0, y, 0, sizePx, y, 0);
+  }
+
+  // Emphasize the main axes on the ground
+  stroke(150);
+  line(0, 0, 0, sizePx, 0, 0);   // X axis on ground
+  line(0, 0, 0, 0, sizePx, 0);   // Y axis on ground
+}
+
+// =============================== Inputs ===================================
+
+void mousePressed() {
+  // On-screen UI first
+  if (btnPlus.over(mouseX, mouseY)) { btnPlus.click(); return; }
+  if (btnMinus.over(mouseX, mouseY)) { btnMinus.click(); return; }
+  if (btnPause.over(mouseX, mouseY)) { btnPause.click(); return; }
+
+  dragging = true;
+  pmx = mouseX; pmy = mouseY;
+}
+
+void mouseDragged() {
+  if (!dragging) return;
+  float dx = mouseX - pmx;
+  float dy = mouseY - pmy;
+  pmx = mouseX; pmy = mouseY;
+  camYaw   -= dx * 0.006f;
+  camPitch -= dy * 0.006f;
+  camPitch = constrain(camPitch, -PI/2.2f, PI/2.2f);
+}
+
+void mouseReleased() { dragging = false; }
+
+void keyPressed() {
+  if (key == ' ') paused = !paused;
+  if (key == 'r' || key == 'R'){
+    segIdx = 0; tSeg = 0; trail2D.clear();
+    atVertex = true; dwellRemaining = DWELL_MS; lastArrivedVertex = pathOrder[0];
+  }
+  if (key == 'g' || key == 'G'){ showGrid = !showGrid; }
+  if (key == 'a' || key == 'A'){ showAxes = !showAxes; }
+  if (key == '['){ zoomBy(-0.1f); }   // zoom in
+  if (key == ']'){ zoomBy(+0.1f); }   // zoom out
+}
