@@ -1,0 +1,281 @@
+// --- Maze Tracer with Moving Cartesian + Hex Grid (APDE / Processing Android) ---
+// Fixed: includes drawMovingHexGrid(...), removed unused locals, compiles cleanly.
+
+ArrayList<PVector> points = new ArrayList<PVector>();
+ArrayList<PVector> path   = new ArrayList<PVector>();
+
+int currentSegment = 0;
+float t = 0;
+int duration = 4000;     // total animation duration (ms)
+int lastMillis;
+
+PVector originOffset;
+
+// ====== Hex settings ======
+boolean pointyTop = true;   // true = pointy-top, false = flat-top
+float hexSize = 50;         // hex radius
+int hexRadiusToDraw = 9;    // rings around tracer
+
+// Toggles
+boolean showCartesianGrid = true;
+boolean showHexGrid = true;
+
+void setup() {
+  fullScreen();
+  smooth(4);
+
+  originOffset = new PVector(width / 2f, height / 2f);
+  lastMillis = millis();
+
+  // Maze path points
+  points.add(new PVector(-200, -200));
+  points.add(new PVector(200, -200));
+  points.add(new PVector(200, -100));
+  points.add(new PVector(-100, -100));
+  points.add(new PVector(-100, 100));
+  points.add(new PVector(150, 100));
+  points.add(new PVector(150, 200));
+  points.add(new PVector(-200, 200));
+}
+
+void draw() {
+  background(255);
+
+  int currentMillis = millis();
+  int dt = currentMillis - lastMillis;
+  lastMillis = currentMillis;
+
+  if (points.size() < 2) return;
+
+  float segmentDuration = duration / (float)(points.size() - 1);
+  t += dt / segmentDuration;
+
+  if (t >= 1) {
+    t = 0;
+    currentSegment = (currentSegment + 1) % (points.size() - 1);
+  }
+
+  PVector p0 = points.get(currentSegment);
+  PVector p1 = points.get((currentSegment + 1) % points.size());
+  PVector tracer = PVector.lerp(p0, p1, t);                 // tracer in maze coords
+  PVector tracerScreen = PVector.add(tracer, originOffset); // tracer in screen coords
+  path.add(tracerScreen.copy());
+
+  // Maze polyline
+  stroke(0);
+  noFill();
+  strokeWeight(1);
+  beginShape();
+  for (PVector p : points) vertex(p.x + originOffset.x, p.y + originOffset.y);
+  endShape();
+
+  // Moving grids
+  if (showCartesianGrid) drawMovingCartesianGrid(tracer, tracerScreen);
+  if (showHexGrid)       drawMovingHexGrid(tracer, tracerScreen);
+
+  // Tracer path
+  stroke(0, 150, 255);
+  noFill();
+  beginShape();
+  for (PVector p : path) vertex(p.x, p.y);
+  endShape();
+
+  // Tracer dot
+  noStroke();
+  fill(255, 0, 0);
+  ellipse(tracerScreen.x, tracerScreen.y, 10, 10);
+
+  // Readouts
+  fill(0);
+  textAlign(LEFT, BOTTOM);
+  textSize(28);
+  text("Cartesian tracer: (" + round(tracer.x) + ", " + round(tracer.y) + ")", 20, height - 70);
+
+  Axial hexAx = pixelToAxial(new PVector(0, 0)); // tracer is origin of moving hex grid
+  Cube hexCube = axialToCube(hexAx);
+  text("Hex axial (q,r): (" + hexAx.q + ", " + hexAx.r + ")  cube (q,r,s): (" +
+       hexCube.q + ", " + hexCube.r + ", " + hexCube.s + ")", 20, height - 30);
+}
+
+// ====== CARTESIAN MOVING GRID ======
+void drawMovingCartesianGrid(PVector tracer, PVector tracerScreen) {
+  float gridSize = 50;
+  float axisLength = 800;
+  float tickSize = 8;
+
+  strokeWeight(1);
+  textSize(24);
+  fill(0);
+
+  // Horizontal lines
+  for (float i = -axisLength; i <= axisLength; i += gridSize) {
+    float y = tracerScreen.y + i;
+    stroke(230);
+    line(0, y, width, y);
+    if (abs(i) > 0.0001f) {
+      stroke(0);
+      line(tracerScreen.x - tickSize, y, tracerScreen.x + tickSize, y);
+      noStroke();
+      textAlign(LEFT, CENTER);
+      text(str(round(tracer.y + i)), tracerScreen.x + tickSize + 5, y);
+    }
+  }
+
+  // Vertical lines
+  for (float i = -axisLength; i <= axisLength; i += gridSize) {
+    float x = tracerScreen.x + i;
+    stroke(230);
+    line(x, 0, x, height);
+    if (abs(i) > 0.0001f) {
+      stroke(0);
+      line(x, tracerScreen.y - tickSize, x, tracerScreen.y + tickSize);
+      noStroke();
+      textAlign(CENTER, TOP);
+      text(str(round(tracer.x + i)), x, tracerScreen.y + tickSize + 5);
+    }
+  }
+
+  // Central axes
+  stroke(0);
+  strokeWeight(3);
+  line(tracerScreen.x - axisLength, tracerScreen.y, tracerScreen.x + axisLength, tracerScreen.y);
+  line(tracerScreen.x, tracerScreen.y - axisLength, tracerScreen.x, tracerScreen.y + axisLength);
+
+  // Label origin (tracer)
+  noStroke();
+  fill(0);
+  textAlign(LEFT, TOP);
+  text("(" + round(tracer.x) + ", " + round(tracer.y) + ")", tracerScreen.x + 10, tracerScreen.y + 10);
+}
+
+// ====== HEX GRID TYPES & HELPERS ======
+class Axial {
+  int q, r;
+  Axial(int q, int r) { this.q = q; this.r = r; }
+}
+class Cube {
+  int q, r, s;
+  Cube(int q, int r, int s) { this.q = q; this.r = r; this.s = s; }
+}
+class CubeF {
+  float q, r, s;
+  CubeF(float q, float r, float s) { this.q = q; this.r = r; this.s = s; }
+}
+
+Cube axialToCube(Axial a) {
+  int q = a.q;
+  int r = a.r;
+  int s = -q - r;
+  return new Cube(q, r, s);
+}
+Axial cubeToAxial(Cube c) { return new Axial(c.q, c.r); }
+
+Cube cubeRound(CubeF c) {
+  int rq = round(c.q);
+  int rr = round(c.r);
+  int rs = round(c.s);
+
+  float dq = abs(rq - c.q);
+  float dr = abs(rr - c.r);
+  float ds = abs(rs - c.s);
+
+  if (dq > dr && dq > ds) {
+    rq = -rr - rs;
+  } else if (dr > ds) {
+    rr = -rq - rs;
+  } else {
+    rs = -rq - rr;
+  }
+  return new Cube(rq, rr, rs);
+}
+
+// Axial -> local pixel (relative to tracer)
+PVector axialToPixel(Axial a) {
+  float x, y;
+  if (pointyTop) {
+    x = hexSize * (sqrt(3) * (a.q + a.r / 2.0f));
+    y = hexSize * (3.0f/2.0f * a.r);
+  } else {
+    x = hexSize * (3.0f/2.0f * a.q);
+    y = hexSize * (sqrt(3) * (a.r + a.q / 2.0f));
+  }
+  return new PVector(x, y);
+}
+
+// local pixel (relative to tracer) -> nearest axial
+Axial pixelToAxial(PVector p) {
+  if (pointyTop) {
+    float qf = (sqrt(3)/3.0f * p.x - 1.0f/3.0f * p.y) / hexSize;
+    float rf = (2.0f/3.0f * p.y) / hexSize;
+    CubeF cf = new CubeF(qf, rf, -qf - rf);
+    Cube cr = cubeRound(cf);
+    return cubeToAxial(cr);
+  } else {
+    float qf = (2.0f/3.0f * p.x) / hexSize;
+    float rf = (-1.0f/3.0f * p.x + sqrt(3)/3.0f * p.y) / hexSize;
+    CubeF cf = new CubeF(qf, rf, -qf - rf);
+    Cube cr = cubeRound(cf);
+    return cubeToAxial(cr);
+  }
+}
+
+// Hex polygon
+PVector[] hexPolygon(float cx, float cy, float size, boolean pointy) {
+  PVector[] v = new PVector[6];
+  float startAngle = pointy ? PI/6.0f : 0;
+  for (int i = 0; i < 6; i++) {
+    float ang = startAngle + TWO_PI * i / 6.0f;
+    v[i] = new PVector(cx + size * cos(ang), cy + size * sin(ang));
+  }
+  return v;
+}
+void drawHex(float cx, float cy) {
+  PVector[] pts = hexPolygon(cx, cy, hexSize, pointyTop);
+  noFill();
+  stroke(200);
+  strokeWeight(1);
+  beginShape();
+  for (int i = 0; i < 6; i++) vertex(pts[i].x, pts[i].y);
+  endShape(CLOSE);
+}
+
+// ====== MOVING HEX GRID (centered on tracer) ======
+void drawMovingHexGrid(PVector tracer, PVector tracerScreen) {
+  for (int r = -hexRadiusToDraw; r <= hexRadiusToDraw; r++) {
+    int qmin = max(-hexRadiusToDraw, -r - hexRadiusToDraw);
+    int qmax = min(hexRadiusToDraw, -r + hexRadiusToDraw);
+    for (int q = qmin; q <= qmax; q++) {
+      Axial a = new Axial(q, r);
+      PVector local = axialToPixel(a);
+      float sx = tracerScreen.x + local.x;
+      float sy = tracerScreen.y + local.y;
+
+      // Cull off-screen hexes
+      if (sx < -hexSize || sx > width + hexSize || sy < -hexSize || sy > height + hexSize) continue;
+      drawHex(sx, sy);
+
+      // Optional: small ticks to hint axes
+      if (r == 0 && q != 0) { stroke(120); line(sx - 6, sy - 6, sx + 6, sy + 6); }
+      if (q == 0 && r != 0) { stroke(120); line(sx - 6, sy + 6, sx + 6, sy - 6); }
+    }
+  }
+
+  // Emphasize origin hex at tracer
+  stroke(0);
+  strokeWeight(2);
+  drawHex(tracerScreen.x, tracerScreen.y);
+
+  // Label origin hex
+  fill(0);
+  noStroke();
+  textAlign(LEFT, TOP);
+  textSize(24);
+  text("Hex (0,0)", tracerScreen.x + 12, tracerScreen.y + 12);
+}
+
+// ====== Key toggles ======
+void keyPressed() {
+  if (key == 'c' || key == 'C') showCartesianGrid = !showCartesianGrid;
+  if (key == 'h' || key == 'H') showHexGrid = !showHexGrid;
+  if (key == 'o' || key == 'O') pointyTop = !pointyTop; // switch orientation
+}
