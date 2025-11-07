@@ -1,0 +1,301 @@
+// --- Maze Tracer: Square-Grid Tracing a Hexagon (Absolute World) ---
+// Tracer follows a regular hex outline, but movement is constrained to a SQUARE grid.
+// Uses Bresenham-style rasterization of each hex edge onto cartesian grid points.
+
+ArrayList<PVector> points = new ArrayList<PVector>();   // grid path (world coords)
+ArrayList<PVector> path   = new ArrayList<PVector>();   // drawn tail (screen coords)
+
+int currentSegment = 0;
+float t = 0;
+int duration = 6000;       // full loop time (ms) around the hex outline
+int lastMillis;
+
+PVector originOffset;      // world (0,0) mapped to this screen pixel
+
+// ====== Hex outline + square grid settings ======
+boolean pointyTop = true;  // true = pointy-top hex outline, false = flat-top
+float hexPathRadius = 220; // hex outline radius (corner from center) in pixels
+int   gridStep = 20;       // square grid spacing (pixels between grid intersections)
+
+// ====== Visual toggles ======
+boolean showCartesianGrid = true;   // square (moving) grid centered on tracer
+boolean showHexGrid       = false;  // keep available but OFF (you asked for square-grid tracing)
+
+// (kept from your original; used only if you toggle hex rendering back on)
+float hexSize = 50;                 // for optional hex grid draw
+int   hexRadiusToDraw = 9;
+
+void setup() {
+  fullScreen();
+  smooth(4);
+  originOffset = new PVector(width/2f, height/2f);
+  lastMillis = millis();
+
+  buildSquareGridHexPath();  // create grid-snapped hex outline
+}
+
+void draw() {
+  background(255);
+
+  int now = millis();
+  int dt = now - lastMillis;
+  lastMillis = now;
+
+  if (points.size() < 2) return;
+
+  // advance along polyline with constant segment time (uniform over grid points)
+  float segmentDuration = duration / (float)(points.size() - 1);
+  t += dt / segmentDuration;
+  if (t >= 1) {
+    t = 0;
+    currentSegment = (currentSegment + 1) % (points.size() - 1);
+  }
+
+  // world endpoints of current grid segment
+  PVector p0 = points.get(currentSegment);
+  PVector p1 = points.get((currentSegment + 1) % points.size());
+
+  // interpolated tracer world -> screen
+  PVector tracerWorld  = PVector.lerp(p0, p1, t);
+  PVector tracerScreen = PVector.add(tracerWorld, originOffset);
+  path.add(tracerScreen.copy());
+
+  // draw hex outline (the rasterized grid path, as a polyline)
+  stroke(0);
+  strokeWeight(2);
+  noFill();
+  beginShape();
+  for (PVector w : points) vertex(w.x + originOffset.x, w.y + originOffset.y);
+  endShape();
+
+  // optional: square moving grid centered on tracer
+  if (showCartesianGrid) drawMovingCartesianGrid(tracerWorld, tracerScreen);
+
+  // tracer tail
+  stroke(0, 150, 255);
+  strokeWeight(2);
+  noFill();
+  beginShape();
+  for (PVector s : path) vertex(s.x, s.y);
+  endShape();
+
+  // tracer dot
+  noStroke();
+  fill(255, 0, 0);
+  ellipse(tracerScreen.x, tracerScreen.y, 12, 12);
+
+  // readouts
+  fill(0);
+  textAlign(LEFT, BOTTOM);
+  textSize(28);
+  text("Grid tracer (x,y): (" + round(tracerWorld.x) + ", " + round(tracerWorld.y) + ")  step=" + gridStep, 20, height - 30);
+
+  // (leave hex readouts available if you toggle showHexGrid later)
+  if (showHexGrid) {
+    Axial tracerAx = pixelScreenToAxial(tracerScreen);
+    Cube tracerCube = axialToCube(tracerAx);
+    text("Hex axial (q,r): (" + tracerAx.q + ", " + tracerAx.r + ")  cube ("
+         + tracerCube.q + ", " + tracerCube.r + ", " + tracerCube.s + ")", 20, height - 65);
+    drawFixedHexGridAround(tracerWorld, tracerScreen);
+  }
+}
+
+// ================================================================
+// Build hex outline, rasterized onto a SQUARE grid (world coords)
+// ================================================================
+void buildSquareGridHexPath() {
+  points.clear();
+
+  // ideal hex vertices (float world coords)
+  PVector[] v = new PVector[6];
+  float startAng = pointyTop ? PI/6.0f : 0;
+  for (int i = 0; i < 6; i++) {
+    float ang = startAng + TWO_PI * i / 6.0f;
+    v[i] = new PVector(hexPathRadius * cos(ang), hexPathRadius * sin(ang));
+  }
+
+  // snap vertices to grid (reduces gaps)
+  for (int i = 0; i < 6; i++) v[i] = snapToGrid(v[i], gridStep);
+
+  // rasterize each edge using Bresenham in grid units, convert back to world pixels
+  for (int i = 0; i < 6; i++) {
+    PVector a = v[i];
+    PVector b = v[(i + 1) % 6];
+    ArrayList<PVector> seg = bresenhamGrid(a, b, gridStep);
+
+    if (points.isEmpty()) {
+      points.addAll(seg);
+    } else {
+      for (int k = 0; k < seg.size(); k++) {
+        PVector p = seg.get(k);
+        if (k == 0) {
+          PVector last = points.get(points.size() - 1);
+          if (last.x == p.x && last.y == p.y) continue; // avoid duplicate join
+        }
+        points.add(p);
+      }
+    }
+  }
+
+  // explicitly close the loop
+  if (!points.isEmpty()) {
+    PVector first = points.get(0);
+    PVector last  = points.get(points.size() - 1);
+    if (first.x != last.x || first.y != last.y) points.add(first.copy());
+  }
+}
+
+// snap world coordinate to nearest square-grid intersection
+PVector snapToGrid(PVector w, int step) {
+  float gx = round(w.x / step) * step;
+  float gy = round(w.y / step) * step;
+  return new PVector(gx, gy);
+}
+
+// Bresenham between two snapped world points; returns world points on multiples of step
+ArrayList<PVector> bresenhamGrid(PVector aWorld, PVector bWorld, int step) {
+  int ax = round(aWorld.x / step);
+  int ay = round(aWorld.y / step);
+  int bx = round(bWorld.x / step);
+  int by = round(bWorld.y / step);
+
+  ArrayList<PVector> out = new ArrayList<PVector>();
+
+  int dx = abs(bx - ax);
+  int dy = abs(by - ay);
+  int sx = ax < bx ? 1 : -1;
+  int sy = ay < by ? 1 : -1;
+  int x = ax, y = ay;
+
+  if (dx >= dy) {
+    int err = dx / 2;
+    for (;;) {
+      out.add(new PVector(x * step, y * step));
+      if (x == bx && y == by) break;
+      x += sx;
+      err -= dy;
+      if (err < 0) { y += sy; err += dx; }
+    }
+  } else {
+    int err = dy / 2;
+    for (;;) {
+      out.add(new PVector(x * step, y * step));
+      if (x == bx && y == by) break;
+      y += sy;
+      err -= dx;
+      if (err < 0) { x += sx; err += dy; }
+    }
+  }
+  return out;
+}
+
+// ==================== Moving cartesian grid (centered on tracer) ====================
+void drawMovingCartesianGrid(PVector tracerWorld, PVector tracerScreen) {
+  float axisLength = 800;
+  float tickSize = 8;
+
+  strokeWeight(1);
+  textSize(22);
+  fill(0);
+
+  for (float i = -axisLength; i <= axisLength; i += gridStep) {
+    float y = tracerScreen.y + i;
+    stroke(235); line(0, y, width, y);
+    if (abs(i) > 0.0001f) { stroke(0); line(tracerScreen.x - tickSize, y, tracerScreen.x + tickSize, y); }
+  }
+  for (float i = -axisLength; i <= axisLength; i += gridStep) {
+    float x = tracerScreen.x + i;
+    stroke(235); line(x, 0, x, height);
+    if (abs(i) > 0.0001f) { stroke(0); line(x, tracerScreen.y - tickSize, x, tracerScreen.y + tickSize); }
+  }
+
+  stroke(0);
+  strokeWeight(3);
+  line(tracerScreen.x - axisLength, tracerScreen.y, tracerScreen.x + axisLength, tracerScreen.y);
+  line(tracerScreen.x, tracerScreen.y - axisLength, tracerScreen.x, tracerScreen.y + axisLength);
+}
+
+// ====== (kept) HEX helpers: only used if you toggle showHexGrid ======
+class Axial { int q, r; Axial(int q, int r){ this.q=q; this.r=r; } }
+class Cube  { int q, r, s; Cube(int q,int r,int s){ this.q=q; this.r=r; this.s=s; } }
+class CubeF { float q, r, s; CubeF(float q,float r,float s){ this.q=q; this.r=r; this.s=s; } }
+
+Cube axialToCube(Axial a){ int q=a.q, r=a.r, s=-q-r; return new Cube(q,r,s); }
+Axial cubeToAxial(Cube c){ return new Axial(c.q,c.r); }
+
+Cube cubeRound(CubeF c){
+  int rq = round(c.q), rr = round(c.r), rs = round(c.s);
+  float dq = abs(rq - c.q), dr = abs(rr - c.r), ds = abs(rs - c.s);
+  if (dq > dr && dq > ds) rq = -rr - rs;
+  else if (dr > ds)       rr = -rq - rs;
+  else                    rs = -rq - rr;
+  return new Cube(rq, rr, rs);
+}
+
+Axial pixelScreenToAxial(PVector screenPx) {
+  PVector p = PVector.sub(screenPx, originOffset);
+  if (pointyTop) {
+    float qf = (sqrt(3)/3.0f * p.x - 1.0f/3.0f * p.y) / hexSize;
+    float rf = (2.0f/3.0f * p.y) / hexSize;
+    CubeF cf = new CubeF(qf, rf, -qf - rf);
+    return cubeToAxial(cubeRound(cf));
+  } else {
+    float qf = (2.0f/3.0f * p.x) / hexSize;
+    float rf = (-1.0f/3.0f * p.x + sqrt(3)/3.0f * p.y) / hexSize;
+    CubeF cf = new CubeF(qf, rf, -qf - rf);
+    return cubeToAxial(cubeRound(cf));
+  }
+}
+
+PVector[] hexPolygon(float cx, float cy, float size, boolean pointy) {
+  PVector[] v = new PVector[6];
+  float startAngle = pointy ? PI/6.0f : 0;
+  for (int i = 0; i < 6; i++) {
+    float ang = startAngle + TWO_PI * i / 6.0f;
+    v[i] = new PVector(cx + size * cos(ang), cy + size * sin(ang));
+  }
+  return v;
+}
+
+PVector axialToPixelLocal(Axial a) {
+  float x, y;
+  if (pointyTop) {
+    x = hexSize * (sqrt(3) * (a.q + a.r / 2.0f));
+    y = hexSize * (3.0f/2.0f * a.r);
+  } else {
+    x = hexSize * (3.0f/2.0f * a.q);
+    y = hexSize * (sqrt(3) * (a.r + a.q / 2.0f));
+  }
+  return new PVector(x, y);
+}
+PVector axialToPixelWorld(Axial a){ return PVector.add(axialToPixelLocal(a), originOffset); }
+
+void drawHexAtWorld(Axial a) {
+  PVector p = axialToPixelWorld(a);
+  PVector[] pts = hexPolygon(p.x, p.y, hexSize, pointyTop);
+  noFill(); stroke(200); strokeWeight(1);
+  beginShape(); for (int i = 0; i < 6; i++) vertex(pts[i].x, pts[i].y); endShape(CLOSE);
+}
+
+void drawFixedHexGridAround(PVector tracerWorld, PVector tracerScreen) {
+  Axial centerAx = pixelScreenToAxial(tracerScreen);
+  for (int r = -hexRadiusToDraw; r <= hexRadiusToDraw; r++) {
+    int qmin = max(-hexRadiusToDraw, -r - hexRadiusToDraw);
+    int qmax = min(hexRadiusToDraw, -r + hexRadiusToDraw);
+    for (int q = qmin; q <= qmax; q++) {
+      Axial a = new Axial(q + centerAx.q, r + centerAx.r);
+      PVector world = axialToPixelWorld(a);
+      if (world.x < -hexSize || world.x > width + hexSize || world.y < -hexSize || world.y > height + hexSize) continue;
+      drawHexAtWorld(a);
+    }
+  }
+}
+
+// ====== Keys ======
+void keyPressed() {
+  if (key == 'c' || key == 'C') showCartesianGrid = !showCartesianGrid;
+  if (key == 'h' || key == 'H') showHexGrid = !showHexGrid;        // optional, off by default
+  if (key == 'o' || key == 'O') { pointyTop = !pointyTop; buildSquareGridHexPath(); } // flip hex orientation + rebuild
+  if (key == '+' || key == '=') { gridStep = max(4, gridStep + 2); buildSquareGridHexPath(); }
+  if (key == '-' || key == '_') { gridStep = max(2, gridStep - 2); buildSquareGridHexPath(); }
+}
