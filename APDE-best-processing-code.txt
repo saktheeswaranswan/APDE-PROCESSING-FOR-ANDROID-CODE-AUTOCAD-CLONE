@@ -1,0 +1,490 @@
+  
+Conversation opened. 1 read message.
+
+Skip to content
+Using Gmail with screen readers
+1 of 463
+bbbbb
+RANDOM NEURAL MONK <bolacalculus@gmail.com>
+	
+5:49 PM (1 minute ago)
+	
+	
+to calculusbola
+/*
+ * Maze Tracer 3D — Cube Edge Tracer (Origin at Cube Corner)
+ * - Full UI: x,y,z textboxes (meters), ENTER, CL, TR, RL, CLR, MODE, LOOP
+ * - Zoom, Pause, Reset, Grid/Axes toggles
+ * - 3D labels near red spheres (cube vertices & user points) in world space
+ *   -> textMode(MODEL) so labels rotate with the object (not HUD)
+ * - Tracer moves with dwell at vertices and lerp interpolation
+ */
+
+final float PX_PER_M = 100.0f;     // pixels per meter
+final float EDGE_M    = 2.0f;      // cube edge length in meters
+final float EDGE_PX   = EDGE_M * PX_PER_M; // pixels
+final int   TRACE_DURATION_MS = 12000;     // moving time over all edges
+final int   DWELL_MS = 500;                // pause 0.5s at each vertex
+
+// Geometry
+PVector[] verts;     // 8 cube vertices (world px)
+int[] pathOrder;     // edge-walk order over cube vertices (auto mode)
+ArrayList<PVector> trail2D = new ArrayList<PVector>(); // HUD trail points (screen px)
+
+// Time / tracer
+int lastMillis;
+float tSeg = 0;      // 0..1 within segment
+int segIdx = 0;
+boolean paused = false;
+
+// Dwell state
+boolean atVertex = false;      // parked on a vertex?
+int dwellRemaining = 0;        // ms left to dwell
+int lastArrivedVertex = -1;    // index we just reached (auto: cube vertex index, user: user point index)
+
+// Camera/orbit (camera orbits around cube center, NOT at origin corner)
+float camYaw   = PI/5.0f;     // left-right orbit angle
+float camPitch = -PI/7.0f;    // up-down orbit angle
+float camDist  = 6.0f * PX_PER_M; // distance in pixels
+int pmx, pmy;
+boolean dragging = false;
+
+// Look target = cube center
+final PVector lookTarget = new PVector(EDGE_PX/2f, EDGE_PX/2f, EDGE_PX/2f);
+
+// Toggles
+boolean showGrid = true;
+boolean showAxes = true;
+
+// UI buttons (zoom/pause + many logical IDs)
+class Btn {
+  String label; float x,y,w,h; int id; // id used by the handler
+  Btn(String label,float x,float y,float w,float h,int id){this.label=label;this.x=x;this.y=y;this.w=w;this.h=h;this.id=id;}
+  void draw(){
+    hint(DISABLE_DEPTH_TEST);
+    pushStyle(); noStroke();
+    fill(255,245); rect(x,y,w,h,10);
+    fill(0); textAlign(CENTER,CENTER); textSize(16); text(label, x+w/2, y+h/2);
+    popStyle();
+    hint(ENABLE_DEPTH_TEST);
+  }
+  boolean over(float mx,float my){ return mx>=x && mx<=x+w && my>=y && my<=y+h; }
+  void click(){
+    if (id==0) zoomBy(-0.1f);
+    if (id==1) zoomBy(+0.1f);
+    if (id==2) paused = !paused;
+  }
+}
+Btn btnPlus, btnMinus, btnPause;
+
+// --- Simple TextBox implementation for user input (meters) ---
+class TextBox{
+  float x,y,w,h; String text = ""; boolean active=false; String hint = "";
+  TextBox(float x,float y,float w,float h,String hint){this.x=x;this.y=y;this.w=w;this.h=h; this.hint=hint;}
+  void draw(){
+    hint(DISABLE_DEPTH_TEST);
+    pushStyle();
+    stroke(0); strokeWeight(1);
+    if (active) fill(255,255,230); else fill(255,245);
+    rect(x,y,w,h,8);
+    fill(0); textAlign(LEFT, CENTER); textSize(14);
+    String disp = text.length()>0 ? text : hint;
+    if (text.length()==0) fill(120);
+    text(disp, x+8, y+h/2);
+    popStyle();
+    hint(ENABLE_DEPTH_TEST);
+  }
+  boolean over(float mx,float my){ return mx>=x && mx<=x+w && my>=y && my<=y+h; }
+  void keyTyped(char k){
+    if (!active) return;
+    if (k==BACKSPACE){ if (text.length()>0) text = text.substring(0, text.length()-1); }
+    else if (k=='\n' || k=='\r') { active = false; }
+    else { if ((k>='0' && k<='9') || k=='.' || k=='-' ) text += k; }
+  }
+}
+
+// User points (in world pixels).
+ArrayList<PVector> userPointsPx = new ArrayList<PVector>();
+
+// Buttons for point UI (ENTER, CL, TR, RL, CLR, MODE, LOOP)
+Btn btnEnter, btnCL, btnTR, btnRemoveLast, btnClearPoints, btnModeToggle, btnCloseLoop;
+
+// Text boxes for x,y,z (meters)
+TextBox tbX, tbY, tbZ;
+
+// Mode: 0 = Auto cube edges, 1 = User points path
+int mode = 0;
+boolean closeLoop = false;
+boolean showUserLines = false; // toggled by CL
+
+// Fonts / 3D text
+PFont uiFont;
+PFont labelFont;
+final float LABEL_M = 0.08f;               // label text height in meters
+final float LABEL_OFFSET_M = 0.10f;        // offset from sphere center (m)
+final float LABEL_LINE_M = 0.06f;          // small leader line length (m)
+final float SPHERE_VERT_M = 0.06f;         // cube vertex sphere radius (m)
+final float SPHERE_USER_M = 0.04f;         // user point sphere radius (m)
+
+void settings() { fullScreen(P3D); }
+
+void setup() {
+  smooth(8);
+  textMode(MODEL);              // <<< key: text is truly 3D and rotates with world
+  uiFont    = createFont("SansSerif", 16, true);
+  labelFont = createFont("SansSerif", 32, true); // base; we’ll scale via meters
+  textFont(uiFont); // for HUD only
+
+  initCubeCornerOrigin();
+  lastMillis = millis();
+
+  float bw=52, bh=36, pad=12;
+  btnPlus  = new Btn("+", width - pad - bw, pad, bw, bh, 0);
+  btnMinus = new Btn("−", width - pad - bw, pad + bh + 8, bw, bh, 1);
+  btnPause = new Btn("⏯", width - pad - bw, pad + 2*(bh + 8), bw, bh, 2);
+
+  // Point UI at top-left
+  float ux = 20, uy = 92;
+  tbX = new TextBox(ux, uy, 110, 32, "x (m)");
+  tbY = new TextBox(ux+120, uy, 110, 32, "y (m)");
+  tbZ = new TextBox(ux+240, uy, 110, 32, "z (m)");
+
+  btnEnter       = new Btn("ENTER", ux+360, uy, 90, 32, 10);
+  btnCL          = new Btn("CL", ux+458, uy, 52, 32, 11);
+  btnTR          = new Btn("TR", ux+516, uy, 52, 32, 12);
+  btnRemoveLast  = new Btn("RL", ux+574, uy, 52, 32, 13);
+  btnClearPoints = new Btn("CLR", ux+632, uy, 58, 32, 14);
+
+  btnModeToggle  = new Btn("MODE: AUTO", ux+20, uy-44, 140, 32, 15);
+  btnCloseLoop   = new Btn("LOOP: OFF", ux+168, uy-44, 120, 32, 16);
+}
+
+void draw() {
+  // --- time step ---
+  int now = millis(); int dt = now - lastMillis; lastMillis = now; if (!paused) advanceTracer(dt);
+
+  // --- 3D viewport ---
+  background(255);
+  setCamera();
+
+  if (showGrid) drawGroundGridCorner(EDGE_M*2.0f, 0.25f); // ground grid
+  if (showAxes) drawAxesFromCorner(EDGE_PX * 1.2f);
+
+  stroke(20); strokeWeight(2); noFill();
+  drawCubeEdges();
+  drawVerticesWith3DLabels();
+
+  // User points & connecting polyline (CL toggle)
+  drawUserPointsAndLinesWith3DLabels();
+
+  // Tracer
+  PVector tracer = getTracerWorldPx();
+  pushMatrix(); translate(tracer.x, tracer.y, tracer.z); noStroke(); fill(255,0,0); sphereDetail(20); sphere(PX_PER_M * 0.08f); popMatrix();
+
+  // keep 2D trail as-is (HUD)
+  float sx = screenX(tracer.x, tracer.y, tracer.z); float sy = screenY(tracer.x, tracer.y, tracer.z);
+  trail2D.add(new PVector(sx, sy)); if (trail2D.size() > 400) trail2D.remove(0);
+
+  drawHUD(tracer, sx, sy);
+
+  // UI buttons
+  btnPlus.draw(); btnMinus.draw(); btnPause.draw();
+  tbX.draw(); tbY.draw(); tbZ.draw();
+  btnEnter.draw(); btnCL.draw(); btnTR.draw(); btnRemoveLast.draw(); btnClearPoints.draw();
+  btnModeToggle.draw(); btnCloseLoop.draw();
+}
+
+// ============================= Geometry ==============================
+
+void initCubeCornerOrigin() {
+  verts = new PVector[8]; float[] s = { 0, EDGE_PX }; int idx = 0;
+  for (int zi = 0; zi < 2; zi++) for (int yi = 0; yi < 2; yi++) for (int xi = 0; xi < 2; xi++) verts[idx++] = new PVector(s[xi], s[yi], s[zi]);
+  // A reasonable continuous edge-walk path around the cube
+  pathOrder = new int[]{ 0,1,3,2,0, 4,5,7,6,4, 5,1,3,7,6,2,0 };
+  segIdx = 0; tSeg = 0; trail2D.clear(); atVertex = true; dwellRemaining = DWELL_MS; lastArrivedVertex = pathOrder[0];
+}
+
+void drawCubeEdges() {
+  int[][] edges = { {0,1},{2,3},{4,5},{6,7}, {0,2},{1,3},{4,6},{5,7}, {0,4},{1,5},{2,6},{3,7} };
+  for (int[] e : edges) { PVector a = verts[e[0]], b = verts[e[1]]; line(a.x, a.y, a.z, b.x, b.y, b.z); }
+}
+
+void drawVerticesWith3DLabels() {
+  noStroke();
+  for (int i=0;i<verts.length;i++){
+    PVector v = verts[i];
+    // red vertex sphere
+    pushMatrix(); translate(v.x, v.y, v.z); fill(255,0,0); sphereDetail(16); sphere(PX_PER_M * SPHERE_VERT_M); popMatrix();
+
+    // 3D label next to sphere (offset along (1,1,1) direction)
+    String lbl = i + ": (" + nf(v.x/PX_PER_M,0,2) + ", " + nf(v.y/PX_PER_M,0,2) + ", " + nf(v.z/PX_PER_M,0,2) + ") m";
+    PVector offset = new PVector(1,1,1).normalize(null).mult(LABEL_OFFSET_M*PX_PER_M);
+    draw3DLabel(v.x + offset.x, v.y + offset.y, v.z + offset.z, lbl, color(190,0,0));
+  }
+}
+
+// ============================ User Points & Lines =======================
+
+void drawUserPointsAndLinesWith3DLabels(){
+  // optional connected polyline (3D)
+  if (userPointsPx.size()>0 && showUserLines){
+    stroke(0,100,200); strokeWeight(2); noFill();
+    beginShape(); for (PVector p: userPointsPx) vertex(p.x,p.y,p.z); if (closeLoop && userPointsPx.size()>1) { PVector p0=userPointsPx.get(0); vertex(p0.x,p0.y,p0.z); } endShape();
+  }
+  // spheres and labels always
+  for (int idx=0; idx<userPointsPx.size(); idx++){
+    PVector p = userPointsPx.get(idx);
+    // blue user point sphere
+    pushMatrix(); translate(p.x,p.y,p.z); noStroke(); fill(0,120,200); sphereDetail(12); sphere(PX_PER_M*SPHERE_USER_M); popMatrix();
+    // label (offset in (1,0.6,0.8) to vary)
+    String lbl = idx + ": (" + nf(p.x/PX_PER_M,0,2) + ", " + nf(p.y/PX_PER_M,0,2) + ", " + nf(p.z/PX_PER_M,0,2) + ") m";
+    PVector dir = new PVector(1,0.6f,0.8f).normalize(null).mult(LABEL_OFFSET_M*PX_PER_M);
+    draw3DLabel(p.x + dir.x, p.y + dir.y, p.z + dir.z, lbl, color(0,90,170));
+  }
+}
+
+// ============================ 3D Label Helper ===============================
+// Renders label as true 3D text (MODEL space). It rotates with the world/cube.
+// Adds a tiny leader line from the sphere to the label position.
+void draw3DLabel(float x, float y, float z, String textStr, int ink){
+  // leader line
+  stroke(ink); strokeWeight(1.5f);
+  // back up a bit towards the point (short line pointing to label)
+  // To get the line start, pull LABEL_LINE_M meters back towards the origin of the label
+  // For simplicity, draw a small crosshair at label anchor.
+  line(x - LABEL_LINE_M*PX_PER_M*0.3f, y, z, x, y, z);
+
+  // label text in world units
+  pushMatrix();
+  translate(x, y, z);
+  // Align the text upright in world XY plane (no billboarding) so it rotates with the scene.
+  // Scale meters->pixels so LABEL_M meters tall text:
+  textFont(labelFont);
+  float pxPerM = PX_PER_M;
+  // textSize in MODEL mode scales with current transform; make height ~ LABEL_M meters:
+  // The ratio between textHeight (in pixels) and textSize is font-dependent; a simple approach:
+  // set textSize so that 1 "unit" ≈ pixels, then scale by (LABEL_M * PX_PER_M)/textAscent().
+  textSize(32);
+  // compute scale factor to target meter height
+  float targetPx = LABEL_M * PX_PER_M;
+  float s = targetPx / max(1, textAscent());
+  scale(s, s, s);
+
+  // draw background plate for readability (very subtle, in world space)
+  float pad = 6;
+  float tw = textWidth(textStr);
+  noStroke();
+  fill(255, 200);
+  // rectangle in text space (origin at label anchor). Shift so text baseline starts slightly right/down.
+  rect(0, -textAscent()*0.85f, tw + pad*2, textAscent()*1.2f + pad, 4);
+
+  // draw text
+  fill(ink);
+  textAlign(LEFT, BASELINE);
+  text(textStr, pad, 0);
+
+  popMatrix();
+}
+
+// ============================ Tracer ===============================
+
+void advanceTracer(int dt) {
+  if (mode==0){
+    advanceTracerForOrder(pathOrder, dt);
+  } else {
+    if (userPointsPx.size()<1) return;
+    int totalPts = userPointsPx.size(); int totalSegs = totalPts - 1 + (closeLoop ? 1 : 0); if (totalSegs<=0) return;
+    int[] pOrder = new int[totalPts]; for (int i=0;i<totalPts;i++) pOrder[i]=i;
+    advanceTracerForUser(pOrder, dt);
+  }
+}
+
+void advanceTracerForOrder(int[] order, int dt){
+  if (order.length < 2) return;
+  float totalSegs = order.length - 1;
+  float segMs = TRACE_DURATION_MS / totalSegs;
+  if (atVertex) {
+    dwellRemaining -= dt;
+    if (dwellRemaining <= 0) {
+      atVertex = false; dwellRemaining = 0;
+      segIdx = (segIdx + 1) % (order.length - 1);
+      tSeg = 0;
+    }
+    return;
+  }
+  tSeg += dt / segMs;
+  if (tSeg >= 1.0f) {
+    tSeg = 1.0f;
+    atVertex = true;
+    dwellRemaining = DWELL_MS;
+    int i1 = order[segIdx + 1];
+    lastArrivedVertex = i1; // vertex index
+  }
+}
+
+void advanceTracerForUser(int[] pOrder, int dt){
+  int n = pOrder.length;
+  int totalSegs = n - 1 + (closeLoop ? 1 : 0);
+  if (totalSegs<=0) return;
+  float segMs = TRACE_DURATION_MS / (float)totalSegs;
+  if (atVertex) {
+    dwellRemaining -= dt;
+    if (dwellRemaining <= 0) {
+      atVertex = false; dwellRemaining = 0;
+      segIdx = (segIdx + 1) % totalSegs;
+      tSeg = 0;
+    }
+    return;
+  }
+  tSeg += dt / segMs;
+  if (tSeg >= 1.0f){
+    tSeg = 1.0f;
+    atVertex = true;
+    dwellRemaining = DWELL_MS;
+    int arrivedIdx = (segIdx+1 < n) ? pOrder[segIdx+1] : pOrder[0];
+    lastArrivedVertex = arrivedIdx; // index into userPointsPx
+  }
+}
+
+PVector getTracerWorldPx() {
+  if (mode==0){
+    int i0 = pathOrder[segIdx];
+    int i1 = pathOrder[segIdx + 1];
+    if (atVertex) return verts[lastArrivedVertex >= 0 ? lastArrivedVertex : i0];
+    else return PVector.lerp(verts[i0], verts[i1], tSeg);
+  } else {
+    int n = userPointsPx.size(); if (n==0) return new PVector(0,0,0);
+    int totalSegs = n - 1 + (closeLoop ? 1 : 0); if (totalSegs<=0) return userPointsPx.get(0);
+    int s = segIdx;
+    int aIdx = s;
+    int bIdx = s+1; if (bIdx >= n) bIdx = 0;
+    PVector a = userPointsPx.get(aIdx); PVector b = userPointsPx.get(bIdx);
+    if (atVertex) return userPointsPx.get(lastArrivedVertex>=0?lastArrivedVertex:aIdx);
+    return PVector.lerp(a,b,tSeg);
+  }
+}
+
+// ============================ Camera / Orbit ==============================
+
+void setCamera() {
+  float cx = lookTarget.x + camDist * cos(camPitch) * cos(camYaw);
+  float cy = lookTarget.y + camDist * sin(camPitch);
+  float cz = lookTarget.z + camDist * cos(camPitch) * sin(camYaw);
+  camera(cx, cy, cz, lookTarget.x, lookTarget.y, lookTarget.z, 0, -1, 0);
+  perspective(PI/3.0f, (float)width/height, PX_PER_M*0.02f, PX_PER_M*1000.0f);
+}
+
+void zoomBy(float amount) { camDist *= (1.0f + 0.8f * amount); camDist = constrain(camDist, PX_PER_M * 1.2f, PX_PER_M * 40.0f); }
+
+// ============================= HUD & Helpers ==============================
+
+void drawHUD(PVector tracerWorldPx, float tracerSX, float tracerSY) {
+  // minimal HUD (kept for trail/status; labels are now 3D)
+  hint(DISABLE_DEPTH_TEST); pushMatrix(); pushStyle(); camera(); ortho(0, width, 0, height, -1, 1);
+
+  // Trail
+  noFill(); stroke(0,150,255); strokeWeight(2); beginShape(); for (PVector p : trail2D) vertex(p.x, p.y); endShape();
+
+  // Status & tracer coords
+  textFont(uiFont);
+  fill(0); textAlign(LEFT, BOTTOM); textSize(16);
+  String status = paused ? "PAUSED" : (atVertex ? "DWELL (0.5s)" : "RUNNING");
+  float xm = tracerWorldPx.x / PX_PER_M, ym = tracerWorldPx.y / PX_PER_M, zm = tracerWorldPx.z / PX_PER_M;
+  text("Mode: " + (mode==0?"AUTO (cube)":"USER (points)") + "   Lines:" + (showUserLines?"ON":"OFF") + "   Loop:" + (closeLoop?"ON":"OFF") + "   Status: " + status, 20, height - 22);
+  text("Tracer (x,y,z) m: (" + nf(xm,1,2) + ", " + nf(ym,1,2) + ", " + nf(zm,1,2) + ")", 20, height - 46);
+
+  textAlign(LEFT, TOP); text("3D Cube (Origin at Corner) • ENTER points → CL to connect → TR to trace  • Drag to orbit", 20, 18);
+
+  popStyle(); popMatrix(); hint(ENABLE_DEPTH_TEST);
+}
+
+// Axes from the corner origin (0,0,0) along +X,+Y,+Z
+void drawAxesFromCorner(float len) {
+  strokeWeight(3); stroke(220,0,0); line(0,0,0,  len,0,0); stroke(0,180,0); line(0,0,0,  0,len,0); stroke(0,0,220); line(0,0,0,  0,0,len);
+  drawAxisTip(len,0,0); drawAxisTip(0,len,0); drawAxisTip(0,0,len);
+  // tiny axis letters in 3D (so they rotate with scene)
+  draw3DLabel(len + 12, 0, 0, "X", color(0));
+  draw3DLabel(0, len + 12, 0, "Y", color(0));
+  draw3DLabel(0, 0, len + 12, "Z", color(0));
+}
+
+void drawAxisTip(float x,float y,float z){ pushMatrix(); translate(x,y,z); noStroke(); fill(0); sphere(PX_PER_M * 0.03f); popMatrix(); }
+
+// Ground grid (XY at z=0)
+void drawGroundGridCorner(float sizeM, float stepM) {
+  int lines = floor(sizeM / stepM); float sizePx = sizeM * PX_PER_M; float stepPx = stepM * PX_PER_M;
+  stroke(230); strokeWeight(1);
+  for (int i=0; i<=lines; i++){ float x = i * stepPx; line(x, 0, 0, x, sizePx, 0); }
+  for (int j=0; j<=lines; j++){ float y = j * stepPx; line(0, y, 0, sizePx, y, 0); }
+  stroke(150); line(0, 0, 0, sizePx, 0, 0); line(0, 0, 0, 0, sizePx, 0);
+}
+
+// =============================== Inputs ===================================
+
+void mousePressed() {
+  // On-screen UI first
+  if (btnPlus.over(mouseX, mouseY)) { btnPlus.click(); return; }
+  if (btnMinus.over(mouseX, mouseY)) { btnMinus.click(); return; }
+  if (btnPause.over(mouseX, mouseY)) { btnPause.click(); return; }
+
+  if (btnEnter.over(mouseX, mouseY)){ handleEnterPoint(); return; }
+  if (btnCL.over(mouseX, mouseY)){ handleCLToggle(); return; }
+  if (btnTR.over(mouseX, mouseY)){ handleTRTrace(); return; }
+  if (btnRemoveLast.over(mouseX, mouseY)){ if (userPointsPx.size()>0) userPointsPx.remove(userPointsPx.size()-1); return; }
+  if (btnClearPoints.over(mouseX, mouseY)){ userPointsPx.clear(); return; }
+  if (btnModeToggle.over(mouseX, mouseY)){ handleModeToggle(); return; }
+  if (btnCloseLoop.over(mouseX, mouseY)){ closeLoop = !closeLoop; btnCloseLoop.label = "LOOP: " + (closeLoop?"ON":"OFF"); return; }
+
+  // textboxes
+  tbX.active = tbX.over(mouseX, mouseY);
+  tbY.active = tbY.over(mouseX, mouseY);
+  tbZ.active = tbZ.over(mouseX, mouseY);
+
+  // otherwise start camera drag
+  dragging = true; pmx = mouseX; pmy = mouseY;
+}
+
+void mouseDragged() {
+  if (!dragging) return; float dx = mouseX - pmx; float dy = mouseY - pmy; pmx = mouseX; pmy = mouseY;
+  camYaw -= dx * 0.006f; camPitch -= dy * 0.006f; camPitch = constrain(camPitch, -PI/2.2f, PI/2.2f);
+}
+
+void mouseReleased() { dragging = false; }
+
+void keyTyped() { if (key==CODED) return; tbX.keyTyped(key); tbY.keyTyped(key); tbZ.keyTyped(key); }
+
+void keyPressed() {
+  if (key == ' ') paused = !paused;
+  if (key == 'r' || key == 'R') resetAll();
+  if (key == 'g' || key == 'G') showGrid = !showGrid;
+  if (key == 'a' || key == 'A') showAxes = !showAxes;
+  if (key == '[')  zoomBy(-0.1f);
+  if (key == ']')  zoomBy(+0.1f);
+}
+
+// ===================== UI Handlers =====================
+
+void handleEnterPoint(){
+  float x = parseFloatOrNaN(tbX.text);
+  float y = parseFloatOrNaN(tbY.text);
+  float z = parseFloatOrNaN(tbZ.text);
+  if (Float.isNaN(x) || Float.isNaN(y) || Float.isNaN(z)) return;
+  x = constrain(x, -10, 10); y = constrain(y, -10, 10); z = constrain(z, -10, 10);
+  userPointsPx.add(new PVector(x*PX_PER_M, y*PX_PER_M, z*PX_PER_M));
+  tbX.text = ""; tbY.text = ""; tbZ.text = "";
+}
+
+void handleCLToggle(){ showUserLines = !showUserLines; btnCL.label = showUserLines?"CL✓":"CL"; }
+
+void handleTRTrace(){ if (userPointsPx.size()<1) return; mode = 1; segIdx = 0; tSeg = 0; atVertex = true; dwellRemaining = DWELL_MS; lastArrivedVertex = 0; btnModeToggle.label = "MODE: USER"; }
+
+void handleModeToggle(){ if (mode==0){ mode = 1; btnModeToggle.label = "MODE: USER"; } else { mode = 0; btnModeToggle.label = "MODE: AUTO"; } }
+
+void resetAll(){ segIdx = 0; tSeg = 0; trail2D.clear(); atVertex = true; dwellRemaining = DWELL_MS; lastArrivedVertex = pathOrder[0]; mode = 0; btnModeToggle.label = "MODE: AUTO"; userPointsPx.clear(); }
+
+// ================== Utilities ==================
+
+float parseFloatOrNaN(String s){ if (s==null || s.length()==0) return Float.NaN; try{ return Float.parseFloat(s); } catch(Exception e){ return Float.NaN; } }
+
+
+	
