@@ -1,0 +1,396 @@
+/* 
+ * Maze Tracer 3D — External OBJ Path (Corner Origin)
+ * - Parses "v x y z" lines below
+ * - Fits points inside a 2 m cube (set IMPORT_NORMALIZE=false for raw coords)
+ * - Draws connected 3D polyline through all points (set closeLoop=true to close)
+ * - Tracer moves point by point (dwell + lerp). Labels are real 3D.
+ * Controls: Drag orbit, [ / ] zoom, Space pause, R reset
+ */
+
+final float PX_PER_M = 100.0f;
+final float EDGE_M   = 2.0f;
+final float EDGE_PX  = EDGE_M * PX_PER_M;
+final int   TRACE_DURATION_MS = 12000;
+final int   DWELL_MS = 500;
+
+final boolean IMPORT_NORMALIZE = true;
+boolean closeLoop = false;
+
+// State
+PVector[] cubeVerts;
+ArrayList<PVector> extPointsPx = new ArrayList<PVector>();
+ArrayList<PVector> trail2D     = new ArrayList<PVector>();
+
+// Tracer
+int    lastMillis;
+float  tSeg = 0;
+int    segIdx = 0;
+boolean paused = false;
+boolean atVertex = false;
+int    dwellRemaining = 0;
+int    lastArrivedIdx = -1;
+
+// Camera
+float camYaw   = PI/5.0f;
+float camPitch = -PI/7.0f;
+float camDist  = 6.0f * PX_PER_M;
+int pmx, pmy; boolean dragging = false;
+
+final PVector lookTarget = new PVector(EDGE_PX/2f, EDGE_PX/2f, EDGE_PX/2f);
+
+// Fonts
+PFont uiFont, labelFont;
+final float LABEL_M = 0.08f;
+final float LABEL_OFFSET_M = 0.10f;
+final float LABEL_LINE_M = 0.06f;
+final float SPHERE_POINT_M = 0.04f;
+
+// Your OBJ list (ASCII only)
+final String RAW_OBJ_VERTS =
+  "v -11.6719 8.96122 -147.218\n" +
+  "v -11.6667 8.96366 -147.218\n" +
+  "v -10.4565 8.76028 -147.941\n" +
+  "v -10.457 8.76312 -147.936\n" +
+  "v -10.4537 8.76151 -147.937\n" +
+  "v -10.4553 8.76816 -147.94\n" +
+  "v -11.7773 10.5791 -147.598\n" +
+  "v -11.7757 10.5808 -147.6\n" +
+  "v -11.7787 10.5826 -147.598\n" +
+  "v -11.7787 10.5826 -147.598\n" +
+  "v -11.7772 10.5857 -147.598\n" +
+  "v -11.7735 10.5821 -147.594\n" +
+  "v -11.7749 10.5844 -147.593\n" +
+  "v -10.0773 10.6389 -148.881\n" +
+  "v -10.0744 10.637 -148.881\n" +
+  "v -10.0752 10.6408 -148.883\n" +
+  "v -10.0752 10.6408 -148.883\n" +
+  "v -10.0788 10.6437 -148.88\n" +
+  "v -10.075 10.639 -148.876\n" +
+  "v -10.075 10.639 -148.876\n" +
+  "v -10.0756 10.6435 -148.878\n" +
+  "v -10.0714 10.6426 -148.878\n" +
+  "v -10.0696 10.6394 -148.876\n" +
+  "v -11.9617 9.97881 -146.239\n" +
+  "v -11.9621 9.98023 -146.237\n" +
+  "v -11.9177 11.1746 -147.312\n" +
+  "v -11.9174 11.1755 -147.313\n" +
+  "v -11.7667 8.55602 -144.816\n" +
+  "v -11.7628 8.55779 -144.816\n" +
+  "v -11.7628 8.55779 -144.816\n" +
+  "v -8.90512 8.74742 -147.801\n" +
+  "v -8.9024 8.74551 -147.8\n" +
+  "v -8.9024 8.74551 -147.8\n" +
+  "v -8.90345 8.74927 -147.802\n" +
+  "v -8.90538 8.7479 -147.795\n" +
+  "v -8.90538 8.7479 -147.795\n" +
+  "v -8.90105 8.74924 -147.801\n" +
+  "v -8.90037 8.74738 -147.8\n" +
+  "v -8.9024 8.74514 -147.795\n" +
+  "v -8.90287 8.74835 -147.794\n" +
+  "v -8.90306 8.75582 -147.799\n" +
+  "v -8.90264 8.75559 -147.799\n" +
+  "v -12.1441 9.37482 -144.88\n" +
+  "v -12.1449 9.37605 -144.878\n" +
+  "v -12.1449 9.37605 -144.878\n" +
+  "v -12.1458 9.38097 -144.877\n" +
+  "v -12.1413 9.37777 -144.878\n" +
+  "v -9.42928 10.6277 -148.826\n" +
+  "v -9.91673 8.55835 -146.072\n" +
+  "v -9.91636 8.55815 -146.07\n" +
+  "v -12.0561 11.766 -147.028\n" +
+  "v -12.0561 11.766 -147.028\n" +
+  "v -12.2066 9.40472 -144.154\n" +
+  "v -12.207 9.40637 -144.154\n" +
+  "v -10.9309 8.37156 -144.347\n" +
+  "v -10.9323 8.37141 -144.342\n" +
+  "v -10.9305 8.37098 -144.343\n" +
+  "v -10.9305 8.37098 -144.343\n" +
+  "v -8.78389 10.6165 -148.769\n" +
+  "v -8.78389 10.6165 -148.769\n" +
+  "v -8.7829 10.6146 -148.767\n" +
+  "v -8.78767 10.6152 -148.762\n" +
+  "v -10.9297 8.37473 -144.343\n" +
+  "v -8.78687 10.6189 -148.765";
+
+void settings(){ fullScreen(P3D); }
+
+void setup(){
+  smooth(8);
+  textMode(MODEL);
+  uiFont    = createFont("SansSerif", 16, true);
+  labelFont = createFont("SansSerif", 32, true);
+  textFont(uiFont);
+
+  initCube();
+  parseAndFitOBJ();
+  resetTracer();
+
+  lastMillis = millis();
+}
+
+void draw(){
+  int now = millis();
+  int dt = now - lastMillis;
+  lastMillis = now;
+  if (!paused) advanceTracer(dt);
+
+  background(255);
+  setCamera();
+
+  drawGroundGridCorner(EDGE_M*2.0f, 0.25f);
+  drawAxesFromCorner(EDGE_PX * 1.2f);
+  drawCubeEdges();
+
+  drawExtPolyline();
+  drawExtPointsWithLabels();
+
+  PVector p = getTracerWorldPx();
+  pushMatrix();
+  translate(p.x, p.y, p.z);
+  noStroke(); fill(255,0,0); sphereDetail(20); sphere(PX_PER_M * 0.08f);
+  popMatrix();
+
+  float sx = screenX(p.x, p.y, p.z);
+  float sy = screenY(p.x, p.y, p.z);
+  trail2D.add(new PVector(sx, sy)); if (trail2D.size() > 400) trail2D.remove(0);
+  drawHUD(p);
+}
+
+// Camera
+void setCamera(){
+  float cx = lookTarget.x + camDist * cos(camPitch) * cos(camYaw);
+  float cy = lookTarget.y + camDist * sin(camPitch);
+  float cz = lookTarget.z + camDist * cos(camPitch) * sin(camYaw);
+  camera(cx, cy, cz, lookTarget.x, lookTarget.y, lookTarget.z, 0, -1, 0);
+  perspective(PI/3.0f, (float)width/height, PX_PER_M*0.02f, PX_PER_M*1000.0f);
+}
+
+// Cube / grid / axes
+void initCube(){
+  cubeVerts = new PVector[8]; float[] s = { 0, EDGE_PX }; int idx = 0;
+  for (int zi=0; zi<2; zi++)
+    for (int yi=0; yi<2; yi++)
+      for (int xi=0; xi<2; xi++)
+        cubeVerts[idx++] = new PVector(s[xi], s[yi], s[zi]);
+}
+
+void drawCubeEdges(){
+  stroke(20); strokeWeight(2); noFill();
+  int[][] edges = { {0,1},{2,3},{4,5},{6,7},
+                    {0,2},{1,3},{4,6},{5,7},
+                    {0,4},{1,5},{2,6},{3,7} };
+  for (int[] e : edges){
+    PVector a = cubeVerts[e[0]], b = cubeVerts[e[1]];
+    line(a.x, a.y, a.z, b.x, b.y, b.z);
+  }
+}
+
+void drawAxesFromCorner(float len){
+  strokeWeight(3);
+  stroke(220,0,0); line(0,0,0,  len,0,0);
+  stroke(0,180,0); line(0,0,0,  0,len,0);
+  stroke(0,0,220); line(0,0,0,  0,0,len);
+  drawAxisTip(len,0,0); drawAxisTip(0,len,0); drawAxisTip(0,0,len);
+  draw3DLabel(len + 12, 0, 0, "X", color(0));
+  draw3DLabel(0, len + 12, 0, "Y", color(0));
+  draw3DLabel(0, 0, len + 12, "Z", color(0));
+}
+
+void drawAxisTip(float x,float y,float z){
+  pushMatrix(); translate(x,y,z); noStroke(); fill(0); sphere(PX_PER_M * 0.03f); popMatrix();
+}
+
+void drawGroundGridCorner(float sizeM, float stepM){
+  int lines = floor(sizeM / stepM);
+  float stepPx = stepM * PX_PER_M;
+  stroke(230); strokeWeight(1);
+  for (int i=0; i<=lines; i++){ float x = i * stepPx; line(x, 0, 0, x, sizeM*PX_PER_M, 0); }
+  for (int j=0; j<=lines; j++){ float y = j * stepPx; line(0, y, 0, sizeM*PX_PER_M, y, 0); }
+  stroke(150); line(0, 0, 0, sizeM*PX_PER_M, 0, 0); line(0, 0, 0, 0, sizeM*PX_PER_M, 0);
+}
+
+// Parse and fit
+void parseAndFitOBJ(){
+  String[] lines = split(RAW_OBJ_VERTS, '\n');
+  ArrayList<PVector> raw = new ArrayList<PVector>();
+  for (String ln : lines){
+    ln = trim(ln);
+    if (ln.length()==0) continue;
+    if (ln.charAt(0)!='v') continue;
+    String[] tok = splitTokens(ln, " \t");
+    if (tok.length<4) continue;
+    float x = parseFloat(tok[1]);
+    float y = parseFloat(tok[2]);
+    float z = parseFloat(tok[3]);
+    raw.add(new PVector(x,y,z));
+  }
+  extPointsPx.clear();
+  if (raw.size()==0) return;
+
+  if (!IMPORT_NORMALIZE){
+    for (PVector p : raw) extPointsPx.add(new PVector(p.x*PX_PER_M, p.y*PX_PER_M, p.z*PX_PER_M));
+    return;
+  }
+
+  PVector minV = raw.get(0).copy();
+  PVector maxV = raw.get(0).copy();
+  for (int i=1;i<raw.size();i++){
+    PVector p = raw.get(i);
+    if (p.x<minV.x) minV.x=p.x; if (p.y<minV.y) minV.y=p.y; if (p.z<minV.z) minV.z=p.z;
+    if (p.x>maxV.x) maxV.x=p.x; if (p.y>maxV.y) maxV.y=p.y; if (p.z>maxV.z) maxV.z=p.z;
+  }
+  float sx = maxV.x - minV.x;
+  float sy = maxV.y - minV.y;
+  float sz = maxV.z - minV.z;
+  float maxDim = max(sx, max(sy, sz));
+  if (maxDim <= 0) maxDim = 1;
+
+  float margin = 0.10f * EDGE_M;
+  float targetSpan = EDGE_M - 2*margin;
+  float scaleM = targetSpan / maxDim;
+
+  for (PVector p : raw){
+    float nx = (p.x - minV.x) * scaleM + margin;
+    float ny = (p.y - minV.y) * scaleM + margin;
+    float nz = (p.z - minV.z) * scaleM + margin;
+    extPointsPx.add(new PVector(nx*PX_PER_M, ny*PX_PER_M, nz*PX_PER_M));
+  }
+}
+
+// Polyline and labels
+void drawExtPolyline(){
+  if (extPointsPx.size()==0) return;
+  stroke(0,100,200); strokeWeight(2); noFill();
+  beginShape();
+  for (PVector p: extPointsPx) vertex(p.x,p.y,p.z);
+  if (closeLoop && extPointsPx.size()>1){
+    PVector p0 = extPointsPx.get(0); vertex(p0.x,p0.y,p0.z);
+  }
+  endShape();
+}
+
+void drawExtPointsWithLabels(){
+  for (int i=0; i<extPointsPx.size(); i++){
+    PVector p = extPointsPx.get(i);
+    pushMatrix(); translate(p.x,p.y,p.z); noStroke(); fill(0,120,200);
+    sphereDetail(12); sphere(PX_PER_M*SPHERE_POINT_M); popMatrix();
+
+    String lbl = i + ": (" + nf(p.x/PX_PER_M,0,3) + ", " + nf(p.y/PX_PER_M,0,3) + ", " + nf(p.z/PX_PER_M,0,3) + ") m";
+    PVector dir = new PVector(1,0.6f,0.8f);
+    dir.normalize();
+    dir.mult(LABEL_OFFSET_M*PX_PER_M);
+    draw3DLabel(p.x + dir.x, p.y + dir.y, p.z + dir.z, lbl, color(0,90,170));
+  }
+}
+
+// 3D label helper
+void draw3DLabel(float x, float y, float z, String textStr, int ink){
+  stroke(ink); strokeWeight(1.5f);
+  line(x - LABEL_LINE_M*PX_PER_M*0.3f, y, z, x, y, z);
+
+  pushMatrix();
+  translate(x, y, z);
+  textFont(labelFont);
+  textSize(32);
+  float targetPx = LABEL_M * PX_PER_M;
+  float s = targetPx / max(1, textAscent());
+  scale(s, s, s);
+
+  float pad = 6;
+  float tw = textWidth(textStr);
+  noStroke(); fill(255, 200);
+  rect(0, -textAscent()*0.85f, tw + pad*2, textAscent()*1.2f + pad, 4);
+
+  fill(ink);
+  textAlign(LEFT, BASELINE);
+  text(textStr, pad, 0);
+  popMatrix();
+}
+
+// Tracer
+void resetTracer(){
+  segIdx = 0; tSeg = 0; trail2D.clear();
+  atVertex = true; dwellRemaining = DWELL_MS; lastArrivedIdx = 0;
+}
+
+void advanceTracer(int dt){
+  int n = extPointsPx.size();
+  if (n < 1) return;
+
+  int totalSegs = n - 1 + (closeLoop ? 1 : 0);
+  if (totalSegs <= 0) return;
+
+  float segMs = TRACE_DURATION_MS / (float)totalSegs;
+
+  if (atVertex){
+    dwellRemaining -= dt;
+    if (dwellRemaining <= 0){
+      atVertex = false; dwellRemaining = 0;
+      segIdx = (segIdx + 1) % totalSegs;
+      tSeg = 0;
+    }
+    return;
+  }
+
+  tSeg += dt / segMs;
+  if (tSeg >= 1.0f){
+    tSeg = 1.0f; atVertex = true; dwellRemaining = DWELL_MS;
+    int arrivedIdx = (segIdx+1 < n) ? (segIdx+1) : 0;
+    lastArrivedIdx = arrivedIdx;
+  }
+}
+
+PVector getTracerWorldPx(){
+  int n = extPointsPx.size();
+  if (n==0) return new PVector(0,0,0);
+  int totalSegs = n - 1 + (closeLoop ? 1 : 0);
+  if (totalSegs<=0) return extPointsPx.get(0);
+
+  int aIdx = segIdx;
+  int bIdx = segIdx + 1; if (bIdx >= n) bIdx = 0;
+
+  PVector a = extPointsPx.get(aIdx);
+  PVector b = extPointsPx.get(bIdx);
+
+  if (atVertex) return extPointsPx.get(lastArrivedIdx>=0?lastArrivedIdx:aIdx);
+  return PVector.lerp(a, b, tSeg);
+}
+
+// HUD
+void drawHUD(PVector p){
+  hint(DISABLE_DEPTH_TEST);
+  pushMatrix(); pushStyle(); 
+  camera(); ortho(0, width, 0, height, -1, 1);
+
+  noFill(); stroke(0,150,255); strokeWeight(2);
+  beginShape(); for (PVector q : trail2D) vertex(q.x, q.y); endShape();
+
+  textFont(uiFont);
+  fill(0); textAlign(LEFT, BOTTOM); textSize(16);
+  String status = paused ? "PAUSED" : (atVertex ? "DWELL (0.5s)" : "RUNNING");
+  text("EXT path  Points: " + extPointsPx.size() + "  Loop: " + (closeLoop?"ON":"OFF") + "  " + status, 20, height - 22);
+  text("Tracer (x,y,z) m: (" + nf(p.x/PX_PER_M,1,3) + ", " + nf(p.y/PX_PER_M,1,3) + ", " + nf(p.z/PX_PER_M,1,3) + ")", 20, height - 46);
+
+  textAlign(LEFT, TOP);
+  text("Drag orbit  [ / ] zoom  Space pause  R reset", 20, 18);
+
+  popStyle(); popMatrix();
+  hint(ENABLE_DEPTH_TEST);
+}
+
+// Input
+void mousePressed(){ dragging = true; pmx = mouseX; pmy = mouseY; }
+void mouseDragged(){ 
+  if (!dragging) return;
+  float dx = mouseX - pmx; float dy = mouseY - pmy; pmx = mouseX; pmy = mouseY;
+  camYaw -= dx * 0.006f; camPitch -= dy * 0.006f; 
+  camPitch = constrain(camPitch, -PI/2.2f, PI/2.2f);
+}
+void mouseReleased(){ dragging = false; }
+
+void keyPressed(){
+  if (key == ' ') paused = !paused;
+  if (key == 'r' || key == 'R') resetTracer();
+  if (key == '[')  camDist = max(PX_PER_M * 1.2f, camDist * 0.92f);
+  if (key == ']')  camDist = min(PX_PER_M * 40.0f, camDist * 1.08f);
+}
